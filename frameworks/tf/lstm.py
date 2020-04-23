@@ -22,6 +22,9 @@ import tensorflow as tf
 from tensorflow.compat import v1
 from tensorflow.compat.v1.nn import rnn_cell
 
+from .base_rnn import BaseRNN
+from .weight_config import WeightConfig
+
 
 __all__ = [
     'LSTM'
@@ -29,24 +32,6 @@ __all__ = [
 
 
 LIB = tf.load_op_library(pkg_resources.resource_filename(__name__, 'libhaste_tf.so'))
-
-
-def reverse_sequence(sequence, sequence_length):
-  """
-  Reverses a batched sequence in time-major order [T,N,...]. The input sequence
-  may be padded, in which case sequence_length specifies the unpadded length of
-  each sequence.
-  """
-  if sequence_length is None:
-    return tf.reverse(sequence, axis=[0])
-  return tf.reverse_sequence(sequence, sequence_length, seq_axis=0, batch_axis=1)
-
-
-def transpose(tensor_or_tuple, perm):
-  """Transposes the given tensor or tuple of tensors by the same permutation."""
-  if isinstance(tensor_or_tuple, tuple):
-    return tuple([tf.transpose(tensor, perm) for tensor in tensor_or_tuple])
-  return tf.transpose(tensor_or_tuple, perm)
 
 
 @tf.RegisterGradient("HasteLstm")
@@ -81,6 +66,9 @@ class LSTMLayer(tf.Module):
         kernel_initializer=None,
         recurrent_initializer=None,
         bias_initializer=None,
+        kernel_transform=None,
+        recurrent_transform=None,
+        bias_transform=None,
         forget_bias=1.0,
         dropout=0.0,
         zoneout=0.0,
@@ -89,19 +77,25 @@ class LSTMLayer(tf.Module):
         cudnn_compat=False):
     super(LSTMLayer, self).__init__(name)
     self.realname = name
+    self.input_size = None
     self.num_units = num_units
 
-    self.kernel_initializer = kernel_initializer or v1.initializers.glorot_uniform()
-    self.recurrent_initializer = recurrent_initializer or v1.initializers.orthogonal()
-    self.bias_initializer = bias_initializer or v1.initializers.zeros()
+    identity = lambda x: x
+    self.kernel_config = WeightConfig(v1.initializers.glorot_uniform(), None, identity)
+    self.recurrent_config = WeightConfig(v1.initializers.orthogonal(), None, identity)
+    self.bias_config = WeightConfig(v1.initializers.zeros(), None, identity)
+
+    self.kernel_config.override(kernel_initializer, None, kernel_transform)
+    self.recurrent_config.override(recurrent_initializer, None, recurrent_transform)
+    self.bias_config.override(bias_initializer, None, bias_transform)
 
     self.forget_bias = forget_bias
     self.dropout = dropout
     self.zoneout = zoneout
     self.dtype = dtype or tf.float32
     self.cudnn_compat = cudnn_compat
+    self.opaque = None
     self.kernel = None
-    self.recurrent_kernel = None
     self.bias = None
     self.built = False
 
@@ -116,64 +110,74 @@ class LSTMLayer(tf.Module):
     recurrent_shape = tf.TensorShape([num_units, num_units])
     bias_shape = tf.TensorShape([num_units])
 
-    kernel_weights = [self.kernel_initializer(kernel_shape, dtype=self.dtype) for _ in range(4)]
-    recurrent_weights = [self.recurrent_initializer(recurrent_shape, dtype=self.dtype) for _ in range(4)]
+    kernel_weights = [self.kernel_config.initializer(kernel_shape, dtype=self.dtype) for _ in range(4)]
+    recurrent_weights = [self.recurrent_config.initializer(recurrent_shape, dtype=self.dtype) for _ in range(4)]
     if self.forget_bias:
       biases = [tf.zeros(bias_shape, dtype=self.dtype) for _ in range(4)]
       biases[2] = tf.constant(self.forget_bias, shape=bias_shape, dtype=self.dtype)
     else:
-      biases = [self.bias_initializer(bias_shape, dtype=self.dtype) for _ in range(4)]
+      biases = [self.bias_config.initializer(bias_shape, dtype=self.dtype) for _ in range(4)]
 
     kernel_weights = tf.concat(kernel_weights, axis=-1)
     recurrent_weights = tf.concat(recurrent_weights, axis=-1)
     biases = tf.concat(biases, axis=-1)
 
-    # Use the same format as LSTMBlockCell.
     if not self.cudnn_compat:
+      # Use the same format as LSTMBlockCell.
       with self.name_scope, v1.variable_scope(self.realname, 'lstm_cell'):
         weights = tf.concat([kernel_weights, recurrent_weights], axis=0)
-        self._kernel = v1.get_variable('kernel', initializer=weights)
-        self.kernel, self.recurrent_kernel = tf.split(self._kernel, [input_size, num_units], axis=0)
+        self.kernel = v1.get_variable('kernel', initializer=weights)
         self.bias = v1.get_variable('bias', initializer=biases)
-        self.built = True
-        return
+    else:
+      # Use the same format as CudnnLSTM.
+      with self.name_scope, v1.variable_scope(self.realname, 'lstm_cell'):
+        with v1.variable_scope('cudnn_lstm'):
+          # Sigh, cuDNN uses two bias vectors instead of just one.
+          extra_biases = [self.bias_initializer(tf.TensorShape([num_units]), dtype=self.dtype) for _ in range(4)]
+          extra_biases = tf.concat(extra_biases, axis=-1)
+          kernel_weights = tf.reshape(kernel_weights, [-1])
+          recurrent_weights = tf.reshape(recurrent_weights, [-1])
+          opaque_initial_value = tf.concat([kernel_weights, recurrent_weights, biases, extra_biases], axis=-1)
+          self.opaque = v1.get_variable('opaque_kernel', initializer=opaque_initial_value)
 
-    # Use the same format as CudnnLSTM.
-    with self.name_scope, v1.variable_scope(self.realname, 'lstm_cell'):
-      with v1.variable_scope('cudnn_lstm'):
-        # Sigh, cuDNN uses two bias vectors instead of just one.
-        extra_biases = [self.bias_initializer(tf.TensorShape([num_units]), dtype=self.dtype) for _ in range(4)]
-        extra_biases = tf.concat(extra_biases, axis=-1)
-        kernel_weights = tf.reshape(kernel_weights, [-1])
-        recurrent_weights = tf.reshape(recurrent_weights, [-1])
-        opaque_initial_value = tf.concat([kernel_weights, recurrent_weights, biases, extra_biases], axis=-1)
-        self.opaque = v1.get_variable('opaque_kernel', initializer=opaque_initial_value)
-
-    # Split into 3 variables.
-    W_size = 4 * input_size * num_units
-    R_size = 4 * num_units * num_units
-    b_size = 8 * num_units
-    kernel, recurrent_kernel, bias = tf.split(opaque, [W_size, R_size, b_size])
-
-    # Convert from cuDNN [i, f, g, o] format to TF and LMNT [i, g, f, o] format.
-    # Note that we only use a single bias vector so we sum the two separate ones
-    # and then reorder formats.
-    Wi, Wf, Wg, Wo = tf.split(kernel, 4)
-    Ri, Rf, Rg, Ro = tf.split(recurrent_kernel, 4)
-    bi, bf, bg, bo = tf.split(tf.reduce_sum(tf.split(bias, 2), axis=0), 4)
-    kernel = tf.concat([Wi, Wg, Wf, Wo], axis=0)
-    recurrent_kernel = tf.concat([Ri, Rg, Rf, Ro], axis=0)
-    bias = tf.concat([bi, bg, bf, bo], axis=0)
-
-    # Shape them correctly.
-    self.kernel = tf.reshape(kernel, [4 * num_units, input_size])
-    self.recurrent_kernel = tf.reshape(recurrent_kernel, [4 * num_units, num_units])
-    self.bias = tf.reshape(bias, [4 * num_units])
-
-    # Pre-transpose the kernels.
-    self.kernel = tf.transpose(self.kernel, [1, 0])
-    self.recurrent_kernel = tf.transpose(self.recurrent_kernel, [1, 0])
+    self.input_size = input_size
     self.built = True
+
+  def get_weights(self):
+    if self.cudnn_compat:
+      # Split into 3 variables.
+      W_size = 4 * self.input_size * self.num_units
+      R_size = 4 * self.num_units * self.num_units
+      b_size = 8 * self.num_units
+      kernel, recurrent_kernel, bias = tf.split(opaque, [W_size, R_size, b_size])
+
+      # Convert from cuDNN [i, f, g, o] format to TF and LMNT [i, g, f, o] format.
+      # Note that we only use a single bias vector so we sum the two separate ones
+      # and then reorder formats.
+      Wi, Wf, Wg, Wo = tf.split(kernel, 4)
+      Ri, Rf, Rg, Ro = tf.split(recurrent_kernel, 4)
+      bi, bf, bg, bo = tf.split(tf.reduce_sum(tf.split(bias, 2), axis=0), 4)
+      kernel = tf.concat([Wi, Wg, Wf, Wo], axis=0)
+      recurrent_kernel = tf.concat([Ri, Rg, Rf, Ro], axis=0)
+      bias = tf.concat([bi, bg, bf, bo], axis=0)
+
+      # Shape them correctly.
+      kernel = tf.reshape(kernel, [4 * self.num_units, self.input_size])
+      recurrent_kernel = tf.reshape(recurrent_kernel, [4 * self.num_units, self.num_units])
+      bias = tf.reshape(bias, [4 * self.num_units])
+
+      # Pre-transpose the kernels.
+      kernel = tf.transpose(kernel, [1, 0])
+      recurrent_kernel = tf.transpose(recurrent_kernel, [1, 0])
+    else:
+      kernel = self.kernel[:-self.num_units]
+      recurrent_kernel = self.kernel[-self.num_units:]
+      bias = self.bias
+    return {
+        'kernel': self.kernel_config.transform(kernel),
+        'recurrent_kernel': self.recurrent_config.transform(recurrent_kernel),
+        'bias': self.bias_config.transform(bias)
+    }
 
   @property
   def state_size(self):
@@ -196,15 +200,15 @@ class LSTMLayer(tf.Module):
     zoneout_mask = tf.zeros([0, 0, 0], dtype=self.dtype)
     if self.zoneout:
       zoneout_mask = 1.0 - self.zoneout
-      zoneout_mask += tf.random_uniform([time_steps, batch_size, self.num_units], dtype=self.dtype)
+      zoneout_mask += tf.random.uniform([time_steps, batch_size, self.num_units], dtype=self.dtype)
       zoneout_mask = tf.floor(zoneout_mask)
 
-    recurrent_kernel = tf.nn.dropout(self.recurrent_kernel, rate=self.dropout)
+    weights = self.get_weights()
     h, c, _ = LIB.haste_lstm(
         x,
-        self.kernel,
-        recurrent_kernel,
-        self.bias,
+        weights['kernel'],
+        tf.nn.dropout(weights['recurrent_kernel'], rate=self.dropout),
+        weights['bias'],
         zoneout_mask,
         training=training,
         zoneout_prob=self.zoneout)
@@ -219,7 +223,7 @@ class LSTMLayer(tf.Module):
     return h[1:], state
 
 
-class LSTM(tf.Module):
+class LSTM(BaseRNN):
   """
   Long Short-Term Memory layer.
 
@@ -251,6 +255,15 @@ class LSTM(tf.Module):
       bias_initializer: (optional) the initializer to use for both input and
         recurrent bias vectors. Defaults to `zeros` unless `forget_bias` is
         non-zero (see below).
+      kernel_transform: (optional) a function with signature
+        `(kernel: Tensor) -> Tensor` that transforms the kernel before it is
+        used. Defaults to the identity function.
+      recurrent_transform: (optional) a function with signature
+        `(recurrent_kernel: Tensor) -> Tensor` that transforms the recurrent
+        kernel before it is used. Defaults to the identity function.
+      bias_transform: (optional) a function with signature
+        `(bias: Tensor) -> Tensor` that transforms the bias before it is used.
+        Defaults to the identity function.
       forget_bias: (optional) float, sets the initial weights for the forget
         gates. Defaults to 1 and overrides the `bias_initializer` unless this
         argument is set to 0.
@@ -266,82 +279,4 @@ class LSTM(tf.Module):
         model. It's currently not possible to train a model with
         `cudnn_compat=True` and restore it with CudnnLSTM. Defaults to `False`.
     """
-    assert direction in ['unidirectional', 'bidirectional']
-
-    if direction == 'bidirectional':
-      name = kwargs.pop('name', None)
-      super(LSTM, self).__init__(name)
-      self.realname = name
-      self.fwd_lstm = LSTMLayer(num_units, name='fw', **kwargs)
-      self.bwd_lstm = LSTMLayer(num_units, name='bw', **kwargs)
-    else:
-      super(LSTM, self).__init__()
-      self.fwd_lstm = LSTMLayer(num_units, **kwargs)
-      self.bwd_lstm = None
-
-  def build(self, shape):
-    """
-    Creates the variables of the layer.
-
-    Calling this method is optional for users of the LSTM class. It is called
-    internally with the correct shape when `__call__` is invoked.
-
-    Arguments:
-        shape: instance of `TensorShape`.
-    """
-    if self.bwd_lstm is not None:
-      with self.name_scope, v1.variable_scope(self.realname, 'lstm_cell'):
-        self.fwd_lstm.build(shape)
-        self.bwd_lstm.build(shape)
-    else:
-      self.fwd_lstm.build(shape)
-
-  @property
-  def output_size(self):
-    if self.bwd_lstm is not None:
-      return self.fwd_lstm.output_size, self.bwd_lstm.output_size
-    return self.fwd_lstm.output_size
-
-  @property
-  def state_size(self):
-    if self.bwd_lstm is not None:
-      return self.fwd_lstm.state_size, self.bwd_lstm.state_size
-    return self.fwd_lstm.state_size
-
-  def __call__(self, inputs, training, sequence_length=None, time_major=False):
-    """
-    Runs the LSTM layer.
-
-    Arguments:
-      inputs: Tensor, a rank 3 input tensor with shape [N,T,C] if `time_major`
-        is `False`, or with shape [T,N,C] if `time_major` is `True`.
-      training: bool, `True` if running in training mode, `False` if running
-        in inference mode.
-      sequence_length: (optional) Tensor, a rank 1 tensor with shape [N] and
-        dtype of `tf.int32` or `tf.int64`. This tensor specifies the unpadded
-        length of each example in the input minibatch.
-      time_major: (optional) bool, specifies whether `input` has shape [N,T,C]
-        (`time_major=False`) or shape [T,N,C] (`time_major=True`).
-
-    Returns:
-      A pair, `(output, state)` for unidirectional layers, or a pair
-      `([output_fwd, output_bwd], [state_fwd, state_bwd])` for bidirectional
-      layers. Each state object will be an instance of `LSTMStateTuple`.
-    """
-    self.build(inputs.shape)
-
-    if not time_major:
-      inputs = transpose(inputs, [1, 0, 2])
-
-    result, state = self.fwd_lstm(inputs, sequence_length, training)
-
-    if self.bwd_lstm is not None:
-      inputs = reverse_sequence(inputs, sequence_length)
-      bwd_result, bwd_state = self.bwd_lstm(inputs, sequence_length, training)
-      result = result, reverse_sequence(bwd_result, sequence_length)
-      state = state, bwd_state
-
-    if not time_major:
-      result = transpose(result, [1, 0, 2])
-
-    return result, state
+    super().__init__(LSTMLayer, num_units, direction, 'lstm_cell', **kwargs)

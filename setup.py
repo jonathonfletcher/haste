@@ -13,8 +13,32 @@
 # limitations under the License.
 # ==============================================================================
 
+import sys
+
 from setuptools import setup
 from setuptools.dist import Distribution
+
+
+VERSION = '0.4.0'
+DESCRIPTION = 'Haste: a fast, simple, and open RNN library.'
+AUTHOR = 'LMNT, Inc.'
+AUTHOR_EMAIL = 'haste@lmnt.com'
+URL = 'https://www.lmnt.com'
+LICENSE = 'Apache 2.0'
+CLASSIFIERS = [
+  'Development Status :: 4 - Beta',
+  'Intended Audience :: Developers',
+  'Intended Audience :: Education',
+  'Intended Audience :: Science/Research',
+  'License :: OSI Approved :: Apache Software License',
+  'Programming Language :: Python :: 3.5',
+  'Programming Language :: Python :: 3.6',
+  'Programming Language :: Python :: 3.7',
+  'Programming Language :: Python :: 3.8',
+  'Topic :: Scientific/Engineering :: Mathematics',
+  'Topic :: Software Development :: Libraries :: Python Modules',
+  'Topic :: Software Development :: Libraries',
+]
 
 
 class BinaryDistribution(Distribution):
@@ -24,31 +48,57 @@ class BinaryDistribution(Distribution):
     return True
 
 
-setup(name = 'haste_tf',
-    version = '0.2.0',
-    description = 'Haste: a fast, simple, and open RNN library.',
-    author = 'LMNT, Inc.',
-    author_email = 'haste@lmnt.com',
-    url = 'https://www.lmnt.com',
-    license = 'Apache 2.0',
-    keywords = 'tensorflow machine learning rnn lstm gru custom op',
-    packages = ['haste_tf'],
-    package_dir = { 'haste_tf': 'tf' },
-    package_data = { 'haste_tf': ['*.so'] },
-    install_requires = [],
-    zip_safe = False,
-    distclass = BinaryDistribution,
-    classifiers = [
-        'Development Status :: 4 - Beta',
-        'Intended Audience :: Developers',
-        'Intended Audience :: Education',
-        'Intended Audience :: Science/Research',
-        'License :: OSI Approved :: Apache Software License',
-        'Programming Language :: Python :: 2.7',
-        'Programming Language :: Python :: 3.4',
-        'Programming Language :: Python :: 3.5',
-        'Programming Language :: Python :: 3.6',
-        'Topic :: Scientific/Engineering :: Mathematics',
-        'Topic :: Software Development :: Libraries :: Python Modules',
-        'Topic :: Software Development :: Libraries',
-    ])
+if sys.argv[1] == 'haste_tf':
+  del sys.argv[1]
+  setup(name = 'haste_tf',
+      version = VERSION,
+      description = DESCRIPTION,
+      author = AUTHOR,
+      author_email = AUTHOR_EMAIL,
+      url = URL,
+      license = LICENSE,
+      keywords = 'tensorflow machine learning rnn lstm gru custom op',
+      packages = ['haste_tf'],
+      package_dir = { 'haste_tf': 'tf' },
+      package_data = { 'haste_tf': ['*.so'] },
+      install_requires = [],
+      zip_safe = False,
+      distclass = BinaryDistribution,
+      classifiers = CLASSIFIERS)
+elif sys.argv[1] == 'haste_pytorch':
+  del sys.argv[1]
+
+  import os
+  from glob import glob
+  from platform import platform
+  from torch.utils import cpp_extension
+
+  base_path = os.path.dirname(os.path.realpath(__file__))
+  if 'Windows' in platform():
+    CUDA_HOME = os.environ.get('CUDA_HOME', os.environ.get('CUDA_PATH'))
+    extra_args = []
+  else:
+    CUDA_HOME = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+    extra_args = ['-Wno-sign-compare']
+
+  extension = cpp_extension.CppExtension(
+      'haste_pytorch_lib',
+      sources = glob('pytorch/*.cc'),
+      extra_compile_args = extra_args,
+      include_dirs = [os.path.join(base_path, 'lib'), os.path.join(CUDA_HOME, 'include')],
+      libraries = ['haste', 'cublas', 'cudart'],
+      library_dirs = ['.', os.path.join(CUDA_HOME, 'lib64'), os.path.join(CUDA_HOME, 'lib', 'x64')])
+  setup(name = 'haste_pytorch',
+      version = VERSION,
+      description = DESCRIPTION,
+      author = AUTHOR,
+      author_email = AUTHOR_EMAIL,
+      url = URL,
+      license = LICENSE,
+      keywords = 'pytorch machine learning rnn lstm gru custom op',
+      packages = ['haste_pytorch'],
+      package_dir = { 'haste_pytorch': 'pytorch' },
+      install_requires = [],
+      ext_modules = [extension],
+      cmdclass = { 'build_ext': cpp_extension.BuildExtension },
+      classifiers = CLASSIFIERS)

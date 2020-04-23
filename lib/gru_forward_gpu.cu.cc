@@ -32,7 +32,7 @@ void PointwiseOperations(const int batch_dim,
                          const T* br,
                          const T* h,
                          T* h_out,
-                         T* v_out,
+                         T* v,
                          const float zoneout_prob,
                          const T* zoneout_mask) {  // Zoneout mask (only used if ApplyZoneout==true)
   const int row = blockDim.x * blockIdx.x + threadIdx.x;
@@ -63,10 +63,10 @@ void PointwiseOperations(const int batch_dim,
   // Store internal activations if we're eventually going to backprop.
   if (Training) {
     const int base_v_idx = col * (hidden_dim * 4) + row;
-    v_out[base_v_idx + 0 * hidden_dim] = z;
-    v_out[base_v_idx + 1 * hidden_dim] = r;
-    v_out[base_v_idx + 2 * hidden_dim] = g;
-    v_out[base_v_idx + 3 * hidden_dim] = Rh[g_idx] + br[bg_idx];
+    v[base_v_idx + 0 * hidden_dim] = z;
+    v[base_v_idx + 1 * hidden_dim] = r;
+    v[base_v_idx + 2 * hidden_dim] = g;
+    v[base_v_idx + 3 * hidden_dim] = Rh[g_idx] + br[bg_idx];
   }
 
   T cur_h_value = z * h[output_idx] + (static_cast<T>(1.0) - z) * g;
@@ -97,6 +97,7 @@ struct ForwardPass<T>::private_data {
   cublasHandle_t blas_handle;
   cudaStream_t stream[2];
   cudaEvent_t event;
+  cudaStream_t sync_stream;
 };
 
 template<typename T>
@@ -105,12 +106,14 @@ ForwardPass<T>::ForwardPass(
     const int batch_size,
     const int input_size,
     const int hidden_size,
-    const cublasHandle_t& blas_handle) : data_(new private_data) {
+    const cublasHandle_t& blas_handle,
+    const cudaStream_t& stream) : data_(new private_data) {
   data_->training = training;
   data_->batch_size = batch_size;
   data_->input_size = input_size;
   data_->hidden_size = hidden_size;
   data_->blas_handle = blas_handle;
+  data_->sync_stream = stream;
   cudaStreamCreate(&data_->stream[0]);
   cudaStreamCreate(&data_->stream[1]);
   cudaEventCreateWithFlags(&data_->event, cudaEventDisableTiming);
@@ -118,8 +121,15 @@ ForwardPass<T>::ForwardPass(
 
 template<typename T>
 ForwardPass<T>::~ForwardPass() {
-  cudaStreamSynchronize(data_->stream[1]);
-  cudaStreamSynchronize(data_->stream[0]);
+  if (data_->sync_stream) {
+    cudaEventRecord(data_->event, data_->stream[1]);
+    cudaStreamWaitEvent(data_->sync_stream, data_->event, 0);
+    cudaEventRecord(data_->event, data_->stream[0]);
+    cudaStreamWaitEvent(data_->sync_stream, data_->event, 0);
+  } else {
+    cudaStreamSynchronize(data_->stream[1]);
+    cudaStreamSynchronize(data_->stream[0]);
+  }
   cudaEventDestroy(data_->event);
   cudaStreamDestroy(data_->stream[1]);
   cudaStreamDestroy(data_->stream[0]);
@@ -135,21 +145,18 @@ void ForwardPass<T>::Iterate(
     const T* x,  // [N,C]
     const T* h,  // [N,H]
     T* h_out,    // [N,H]
-    T* v_out,    // [N,H*4]
+    T* v,        // [N,H*4]
     T* tmp_Wx,   // [N,H*3]
     T* tmp_Rh,   // [N,H*3]
     const float zoneout_prob,
     const T* zoneout_mask) { // Zoneout mask [N,H]
-  // Constants for GEMM
   static const T alpha = static_cast<T>(1.0);
   static const T beta = static_cast<T>(0.0);
 
-  const bool training = data_->training;
   const int batch_size = data_->batch_size;
   const int input_size = data_->input_size;
   const int hidden_size = data_->hidden_size;
   const cublasHandle_t blas_handle = data_->blas_handle;
-  const cudaStream_t stream1 = data_->stream[0];
   const cudaStream_t stream2 = data_->stream[1];
   const cudaEvent_t event = data_->event;
 
@@ -166,6 +173,44 @@ void ForwardPass<T>::Iterate(
       &beta,
       tmp_Wx, hidden_size * 3);
   cudaEventRecord(event, stream2);
+
+  IterateInternal(
+      R,
+      bx,
+      br,
+      h,
+      h_out,
+      v,
+      tmp_Wx,
+      tmp_Rh,
+      zoneout_prob,
+      zoneout_mask);
+
+  cublasSetStream(blas_handle, save_stream);
+}
+
+template<typename T>
+void ForwardPass<T>::IterateInternal(
+    const T* R,  // [H,H*3]
+    const T* bx, // [H*3]
+    const T* br, // [H*3]
+    const T* h,  // [N,H]
+    T* h_out,    // [N,H]
+    T* v,        // [N,H*4]
+    T* tmp_Wx,   // [N,H*3]
+    T* tmp_Rh,   // [N,H*3]
+    const float zoneout_prob,
+    const T* zoneout_mask) { // Zoneout mask [N,H]
+  // Constants for GEMM
+  static const T alpha = static_cast<T>(1.0);
+  static const T beta = static_cast<T>(0.0);
+
+  const bool training = data_->training;
+  const int batch_size = data_->batch_size;
+  const int hidden_size = data_->hidden_size;
+  const cublasHandle_t blas_handle = data_->blas_handle;
+  const cudaStream_t stream1 = data_->stream[0];
+  const cudaEvent_t event = data_->event;
 
   cublasSetStream(blas_handle, stream1);
   blas<T>::gemm(blas_handle,
@@ -196,7 +241,7 @@ void ForwardPass<T>::Iterate(
           br,
           h,
           h_out,
-          v_out,
+          v,
           zoneout_prob,
           zoneout_mask);
     } else {
@@ -209,7 +254,7 @@ void ForwardPass<T>::Iterate(
           br,
           h,
           h_out,
-          v_out,
+          v,
           0.0f,
           nullptr);
     }
@@ -241,6 +286,60 @@ void ForwardPass<T>::Iterate(
           0.0f,
           nullptr);
     }
+  }
+}
+
+template<typename T>
+void ForwardPass<T>::Run(
+    const int steps,
+    const T* W,  // [C,H*3]
+    const T* R,  // [H,H*3]
+    const T* bx, // [H*3]
+    const T* br, // [H*3]
+    const T* x,  // [N,C]
+    T* h,        // [N,H]
+    T* v,        // [N,H*4]
+    T* tmp_Wx,   // [N,H*3]
+    T* tmp_Rh,   // [N,H*3]
+    const float zoneout_prob,
+    const T* zoneout_mask) { // Zoneout mask [N,H]
+  static const T alpha = static_cast<T>(1.0);
+  static const T beta = static_cast<T>(0.0);
+
+  const int batch_size = data_->batch_size;
+  const int input_size = data_->input_size;
+  const int hidden_size = data_->hidden_size;
+  const cublasHandle_t blas_handle = data_->blas_handle;
+  const cudaStream_t stream2 = data_->stream[1];
+  const cudaEvent_t event = data_->event;
+
+  cudaStream_t save_stream;
+  cublasGetStream(blas_handle, &save_stream);
+
+  cublasSetStream(blas_handle, stream2);
+  blas<T>::gemm(blas_handle,
+      CUBLAS_OP_N, CUBLAS_OP_N,
+      hidden_size * 3, steps * batch_size, input_size,
+      &alpha,
+      W, hidden_size * 3,
+      x, input_size,
+      &beta,
+      tmp_Wx, hidden_size * 3);
+  cudaEventRecord(event, stream2);
+
+  const int NH = batch_size * hidden_size;
+  for (int i = 0; i < steps; ++i) {
+    IterateInternal(
+        R,
+        bx,
+        br,
+        h + i * NH,
+        h + (i + 1) * NH,
+        v + i * NH * 4,
+        tmp_Wx + i * NH * 3,
+        tmp_Rh,
+        zoneout_prob,
+        zoneout_mask ? zoneout_mask + i * NH : nullptr);
   }
 
   cublasSetStream(blas_handle, save_stream);

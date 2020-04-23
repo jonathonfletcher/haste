@@ -14,9 +14,9 @@
 // ==============================================================================
 
 #include <cuda_runtime_api.h>
-#include <vector>
 
 #include "haste.h"
+#include "support.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/shape_inference.h"
@@ -31,43 +31,6 @@ using tensorflow::se::Stream;
 using tensorflow::shape_inference::DimensionHandle;
 using tensorflow::shape_inference::InferenceContext;
 using tensorflow::shape_inference::ShapeHandle;
-
-#define REGISTER_GPU_KERNEL(NAME, T)                 \
-  REGISTER_KERNEL_BUILDER(Name(#NAME)                \
-                            .Device(DEVICE_GPU)      \
-                            .TypeConstraint<T>("R"), \
-                          NAME##Op<T>)
-
-// LOL.
-struct CublasHandleContainer {
-  CublasHandleContainer() {
-    int count;
-    int current_device;
-    cudaGetDevice(&current_device);
-    cudaGetDeviceCount(&count);
-    for (int i = 0; i < count; ++i) {
-      cublasHandle_t handle;
-      cudaSetDevice(i);
-      cublasCreate(&handle);
-      handles.push_back(handle);
-    }
-    cudaSetDevice(current_device);
-  }
-
-  ~CublasHandleContainer() {
-    for (auto h : handles)
-      cublasDestroy(h);
-  }
-
-  std::vector<cublasHandle_t> handles;
-};
-
-static cublasHandle_t GetCublasHandle() {
-  static CublasHandleContainer all_handles;
-  int device;
-  cudaGetDevice(&device);
-  return all_handles.handles[device];
-}
 
 // Define the interface and shape function for the op.
 REGISTER_OP("HasteLstm")
@@ -170,7 +133,7 @@ struct HasteLstmOp : public OpKernel {
         batch_size,
         input_size,
         hidden_size,
-        GetCublasHandle());
+        GetCublasHandle(context));
 
     forward.Run(
         time_steps,
@@ -237,10 +200,13 @@ REGISTER_OP("HasteLstmGrad")
       DimensionHandle time_steps = c->Dim(x_shape, 1);
       DimensionHandle batch_size = c->Dim(x_shape, 2);
       DimensionHandle hidden_size = c->Dim(recurrent_kernel_shape, 1);
+      DimensionHandle hidden_size_4;
+
+      TF_RETURN_IF_ERROR(c->Multiply(hidden_size, 4, &hidden_size_4));
 
       c->set_output(0, c->MakeShape({ time_steps, batch_size, input_size }));
-      c->set_output(1, c->MakeShape({ input_size, c->Value(hidden_size) * 4 }));
-      c->set_output(2, c->MakeShape({ hidden_size, c->Value(hidden_size) * 4 }));
+      c->set_output(1, c->MakeShape({ input_size, hidden_size_4 }));
+      c->set_output(2, c->MakeShape({ hidden_size, hidden_size_4 }));
       c->set_output(3, bias_shape);
       return Status::OK();
     });
@@ -256,7 +222,7 @@ struct HasteLstmGradOp : public OpKernel {
     const Tensor& bias = context->input(3);
     const Tensor& h_vector = context->input(4);
     const Tensor& c_vector = context->input(5);
-    const Tensor& v_vector = context->input(6);
+    const Tensor& dv = context->input(6);
     const Tensor& dh_new = context->input(7);
     const Tensor& dc_new = context->input(8);
     const Tensor& zoneout_mask = context->input(9);
@@ -298,10 +264,6 @@ struct HasteLstmGradOp : public OpKernel {
     Tensor dc;
     OP_REQUIRES_OK(context, context->allocate_temp(data_type, dc_shape, &dc));
 
-    Tensor dv;
-    OP_REQUIRES_OK(context,
-        context->forward_input_or_allocate_temp({ 6 }, data_type, v_vector.shape(), &dv));
-
     cudaMemset(dW->flat<T>().data(), 0, dW->AllocatedBytes());
     cudaMemset(dR->flat<T>().data(), 0, dR->AllocatedBytes());
     cudaMemset(db->flat<T>().data(), 0, db->AllocatedBytes());
@@ -312,7 +274,7 @@ struct HasteLstmGradOp : public OpKernel {
         batch_size,
         input_size,
         hidden_size,
-        GetCublasHandle());
+        GetCublasHandle(context));
 
     backward.Run(
         time_steps,
@@ -330,7 +292,7 @@ struct HasteLstmGradOp : public OpKernel {
         db->flat<T>().data(),
         dh.flat<T>().data(),
         dc.flat<T>().data(),
-        dv.flat<T>().data(),
+        const_cast<T*>(dv.flat<T>().data()),
         has_zoneout ? zoneout_mask.flat<T>().data() : nullptr);
   }
 };

@@ -1,6 +1,7 @@
 <div itemscope itemtype="http://developers.google.com/ReferenceObject">
 <meta itemprop="name" content="haste_tf.LSTM" />
 <meta itemprop="path" content="Stable" />
+<meta itemprop="property" content="bidirectional"/>
 <meta itemprop="property" content="name"/>
 <meta itemprop="property" content="name_scope"/>
 <meta itemprop="property" content="output_size"/>
@@ -37,7 +38,7 @@ it offers additional options not typically found in other high-performance
 implementations. DropConnect and Zoneout regularization are built-in, and
 this layer allows setting a non-zero initial forget gate bias.
 
-<h2 id="__init__"><code>__init__</code></h2>
+<h2 id="__init__"><code><a name="__init__">__init__</a></code></h2>
 
 ``` python
 __init__(
@@ -68,6 +69,15 @@ Initialize the parameters of the LSTM layer.
 * <b>`bias_initializer`</b>: (optional) the initializer to use for both input and
   recurrent bias vectors. Defaults to `zeros` unless `forget_bias` is
   non-zero (see below).
+* <b>`kernel_transform`</b>: (optional) a function with signature
+  `(kernel: Tensor) -> Tensor` that transforms the kernel before it is
+  used. Defaults to the identity function.
+* <b>`recurrent_transform`</b>: (optional) a function with signature
+  `(recurrent_kernel: Tensor) -> Tensor` that transforms the recurrent
+  kernel before it is used. Defaults to the identity function.
+* <b>`bias_transform`</b>: (optional) a function with signature
+  `(bias: Tensor) -> Tensor` that transforms the bias before it is used.
+  Defaults to the identity function.
 * <b>`forget_bias`</b>: (optional) float, sets the initial weights for the forget
   gates. Defaults to 1 and overrides the `bias_initializer` unless this
   argument is set to 0.
@@ -86,6 +96,11 @@ Initialize the parameters of the LSTM layer.
 
 
 ## Properties
+
+<h3 id="bidirectional"><code>bidirectional</code></h3>
+
+`True` if this is a bidirectional RNN, `False` otherwise.
+
 
 <h3 id="name"><code>name</code></h3>
 
@@ -166,7 +181,7 @@ first).
 
 ## Methods
 
-<h3 id="__call__"><code>__call__</code></h3>
+<h3 id="__call__"><code><a name="__call__">__call__</a></code></h3>
 
 ``` python
 __call__(
@@ -177,7 +192,7 @@ __call__(
 )
 ```
 
-Runs the LSTM layer.
+Runs the RNN layer.
 
 
 #### Arguments:
@@ -197,11 +212,11 @@ Runs the LSTM layer.
 #### Returns:
 
 A pair, `(output, state)` for unidirectional layers, or a pair
-`([output_fwd, output_bwd], [state_fwd, state_bwd])` for bidirectional
-layers. Each state object will be an instance of `LSTMStateTuple`.
+`([output_fw, output_bw], [state_fw, state_bw])` for bidirectional
+layers.
 
 
-<h3 id="build"><code>build</code></h3>
+<h3 id="build"><code><a name="build">build</a></code></h3>
 
 ``` python
 build(shape)
@@ -209,7 +224,7 @@ build(shape)
 
 Creates the variables of the layer.
 
-Calling this method is optional for users of the LSTM class. It is called
+Calling this method is optional for users of the RNN class. It is called
 internally with the correct shape when `__call__` is invoked.
 
 #### Arguments:
@@ -217,7 +232,7 @@ internally with the correct shape when `__call__` is invoked.
 
 * <b>`shape`</b>: instance of `TensorShape`.
 
-<h3 id="with_name_scope"><code>with_name_scope</code></h3>
+<h3 id="with_name_scope"><code><a name="with_name_scope">with_name_scope</a></code></h3>
 
 ``` python
 @classmethod
