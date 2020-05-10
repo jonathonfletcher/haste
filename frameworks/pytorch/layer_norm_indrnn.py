@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Layer Normalized Gated Recurrent Unit"""
+"""Layer Normalized Independently Recurrent Neural Network"""
 
 
 import haste_pytorch_lib as LIB
@@ -25,104 +25,84 @@ from .base_rnn import BaseRNN
 
 
 __all__ = [
-    'LayerNormGRU'
+    'LayerNormIndRNN'
 ]
 
 
 #@torch.jit.script
-def LayerNormGRUScript(
+def LayerNormIndRNNScript(
     training: bool,
     zoneout_prob: float,
     input,
     h0,
     kernel,
-    recurrent_kernel,
+    recurrent_scale,
     bias,
-    recurrent_bias,
     gamma,
     zoneout_mask):
   time_steps = input.shape[0]
-  batch_size = input.shape[1]
-  hidden_size = recurrent_kernel.shape[0]
+  hidden_size = kernel.shape[1]
 
   h = [h0]
-  Wx = F.layer_norm(input @ kernel, (hidden_size * 3,), weight=gamma[0]) + bias
+  Wx = F.layer_norm(input @ kernel, (hidden_size,), weight=gamma[0]) + bias
   for t in range(time_steps):
-    Rh = F.layer_norm(h[t] @ recurrent_kernel, (hidden_size * 3,), weight=gamma[1]) + recurrent_bias
-    vx = torch.chunk(Wx[t], 3, 1)
-    vh = torch.chunk(Rh, 3, 1)
-
-    z = torch.sigmoid(vx[0] + vh[0])
-    r = torch.sigmoid(vx[1] + vh[1])
-    g = torch.tanh(vx[2] + r * vh[2])
-
-    h.append(z * h[t] + (1 - z) * g)
+    h.append(torch.tanh(Wx[t] + h[-1] * recurrent_scale))
     if zoneout_prob:
       if training:
         h[-1] = (h[-1] - h[-2]) * zoneout_mask[t] + h[-2]
       else:
         h[-1] = zoneout_prob * h[-2] + (1 - zoneout_prob) * h[-1]
-
   h = torch.stack(h)
   return h
 
 
-class LayerNormGRUFunction(torch.autograd.Function):
+class LayerNormIndRNNFunction(torch.autograd.Function):
   @staticmethod
   def forward(ctx, training, zoneout_prob, *inputs):
-    output = LIB.layer_norm_gru_forward(training, zoneout_prob, *inputs)
+    output = LIB.layer_norm_indrnn_forward(training, zoneout_prob, *inputs)
     ctx.save_for_backward(inputs[0], *inputs[2:], *output)
-    ctx.mark_non_differentiable(inputs[-1])
     ctx.training = training
     return output[0]
 
   @staticmethod
   def backward(ctx, grad_h):
     if not ctx.training:
-      raise RuntimeError('LayerNormGRU backward can only be called in training mode')
+      raise RuntimeError('LayerNormIndRNN backward can only be called in training mode')
 
     saved = [*ctx.saved_tensors]
     saved[0] = saved[0].permute(2, 0, 1).contiguous()
     saved[1] = saved[1].permute(1, 0).contiguous()
-    saved[2] = saved[2].permute(1, 0).contiguous()
-    grads = LIB.layer_norm_gru_backward(*saved, grad_h.contiguous())
+    grads = LIB.layer_norm_indrnn_backward(*saved, grad_h.contiguous())
     return (None, None, *grads, None)
 
 
-class LayerNormGRU(BaseRNN):
+class LayerNormIndRNN(BaseRNN):
   """
-  Layer Normalized Gated Recurrent Unit layer.
+  Layer Normalized Independently Recurrent Neural Network layer.
 
-  This GRU layer applies layer normalization to the input and recurrent output
-  activations of a standard GRU. The implementation is fused and
-  GPU-accelerated. There are two commonly-used variants of GRU cells. This one
-  implements 1406.1078v1 which applies the reset gate to the hidden state
-  after matrix multiplication. The other variant, 1406.1078v3, applies the
-  reset gate before matrix multiplication and is currently unsupported.
+  This IndRNN layer applies layer normalization to the input activations of a
+  standard IndRNN. The implementation is fused and GPU-accelerated.
 
-  This layer has built-in support for DropConnect and Zoneout, which are
-  both techniques used to regularize RNNs.
+  This layer has built-in support for Zoneout regularization.
 
   See [\_\_init\_\_](#__init__) and [forward](#forward) for usage.
   """
 
-  def __init__(self,
+  def __init__(
+      self,
       input_size,
       hidden_size,
       batch_first=False,
-      dropout=0.0,
       zoneout=0.0,
       return_state_sequence=False):
     """
-    Initialize the parameters of the GRU layer.
+    Initialize the parameters of the IndRNN layer.
 
     Arguments:
       input_size: int, the feature dimension of the input.
       hidden_size: int, the feature dimension of the output.
       batch_first: (optional) bool, if `True`, then the input and output
         tensors are provided as `(batch, seq, feature)`.
-      dropout: (optional) float, sets the dropout rate for DropConnect
-        regularization on the recurrent matrix.
       zoneout: (optional) float, sets the zoneout rate for Zoneout
         regularization.
       return_state_sequence: (optional) bool, if `True`, the forward pass will
@@ -132,54 +112,50 @@ class LayerNormGRU(BaseRNN):
 
     Variables:
       kernel: the input projection weight matrix. Dimensions
-        (input_size, hidden_size * 3) with `z,r,h` gate layout. Initialized
-        with Xavier uniform initialization.
-      recurrent_kernel: the recurrent projection weight matrix. Dimensions
-        (hidden_size, hidden_size * 3) with `z,r,h` gate layout. Initialized
-        with orthogonal initialization.
-      bias: the input projection bias vector. Dimensions (hidden_size * 3) with
-        `z,r,h` gate layout. Initialized to zeros.
-      recurrent_bias: the recurrent projection bias vector. Dimensions
-        (hidden_size * 3) with `z,r,h` gate layout. Initialized to zeros.
+        (input_size, hidden_size). Initialized with Xavier uniform
+        initialization.
+      recurrent_scale: the recurrent scale weight vector. Dimensions
+        (hidden_size). Initialized uniformly in [-0.5, 0.5]. Note that this
+        initialization scheme is different than in the original authors'
+        implementation. See https://github.com/lmnt-com/haste/issues/7 for
+        details.
+      bias: the RNN bias vector. Dimensions (hidden_size). Initialized to zeros.
       gamma: the input and recurrent normalization gain. Dimensions
-        (2, hidden_size * 3) with `gamma[0]` specifying the input gain and
+        (2, hidden_size) with `gamma[0]` specifying the input gain and
         `gamma[1]` specifying the recurrent gain. Initialized to ones.
     """
     super().__init__(input_size, hidden_size, batch_first, zoneout, return_state_sequence)
 
-    if dropout < 0 or dropout > 1:
-      raise ValueError('LayerNormGRU: dropout must be in [0.0, 1.0]')
     if zoneout < 0 or zoneout > 1:
-      raise ValueError('LayerNormGRU: zoneout must be in [0.0, 1.0]')
+      raise ValueError('LayerNormIndRNN: zoneout must be in [0.0, 1.0]')
 
-    self.dropout = dropout
+    self.input_size = input_size
+    self.hidden_size = hidden_size
+    self.batch_first = batch_first
+    self.zoneout = zoneout
 
-    self.kernel = nn.Parameter(torch.empty(input_size, hidden_size * 3))
-    self.recurrent_kernel = nn.Parameter(torch.empty(hidden_size, hidden_size * 3))
-    self.bias = nn.Parameter(torch.empty(hidden_size * 3))
-    self.recurrent_bias = nn.Parameter(torch.empty(hidden_size * 3))
-    self.gamma = nn.Parameter(torch.empty(2, hidden_size * 3))
+    self.kernel = nn.Parameter(torch.empty(input_size, hidden_size))
+    self.recurrent_scale = nn.Parameter(torch.empty(hidden_size))
+    self.bias = nn.Parameter(torch.empty(hidden_size))
+    self.gamma = nn.Parameter(torch.empty(2, hidden_size))
     self.reset_parameters()
 
   def reset_parameters(self):
     """Resets this layer's parameters to their initial values."""
-    hidden_size = self.hidden_size
-    for i in range(3):
-      nn.init.xavier_uniform_(self.kernel[:, i*hidden_size:(i+1)*hidden_size])
-      nn.init.orthogonal_(self.recurrent_kernel[:, i*hidden_size:(i+1)*hidden_size])
+    nn.init.xavier_uniform_(self.kernel)
+    nn.init.uniform_(self.recurrent_scale, -0.5, 0.5)
     nn.init.zeros_(self.bias)
-    nn.init.zeros_(self.recurrent_bias)
     nn.init.ones_(self.gamma)
 
   def forward(self, input, state=None, lengths=None):
     """
-    Runs a forward pass of the GRU layer.
+    Runs a forward pass of the IndRNN layer.
 
     Arguments:
       input: Tensor, a batch of input sequences to pass through the GRU.
         Dimensions (seq_len, batch_size, input_size) if `batch_first` is
         `False`, otherwise (batch_size, seq_len, input_size).
-      state: (optional) Tensor, the intial state for each batch element in
+      state: (optional) Tensor, the initial state for each batch element in
         `input`. Dimensions (1, batch_size, hidden_size). Defaults to zeros.
       lengths: (optional) Tensor, list of sequence lengths for each batch
         element. Dimension (batch_size). This argument may be omitted if
@@ -192,7 +168,7 @@ class LayerNormGRU(BaseRNN):
         that if `lengths` was specified, the `output` tensor will not be
         masked. It's the caller's responsibility to either not use the invalid
         entries or to mask them out before using them.
-      h_n: the hidden state for the last sequence item. Dimensions
+      state: the hidden state for the last sequence item. Dimensions
         (1, batch_size, hidden_size).
     """
     input = self._permute(input)
@@ -205,26 +181,24 @@ class LayerNormGRU(BaseRNN):
 
   def _impl(self, input, state, zoneout_mask):
     if self._is_cuda():
-      return LayerNormGRUFunction.apply(
-          self.training,
-          self.zoneout,
-          input.contiguous(),
-          state.contiguous(),
-          self.kernel.contiguous(),
-          F.dropout(self.recurrent_kernel, self.dropout, self.training).contiguous(),
-          self.bias.contiguous(),
-          self.recurrent_bias.contiguous(),
-          self.gamma.contiguous(),
-          zoneout_mask.contiguous())
+      return LayerNormIndRNNFunction.apply(
+        self.training,
+        self.zoneout,
+        input.contiguous(),
+        state.contiguous(),
+        self.kernel.contiguous(),
+        self.recurrent_scale.contiguous(),
+        self.bias.contiguous(),
+        self.gamma.contiguous(),
+        zoneout_mask.contiguous())
     else:
-      return LayerNormGRUScript(
-          self.training,
-          self.zoneout,
-          input.contiguous(),
-          state.contiguous(),
-          self.kernel.contiguous(),
-          F.dropout(self.recurrent_kernel, self.dropout, self.training).contiguous(),
-          self.bias.contiguous(),
-          self.recurrent_bias.contiguous(),
-          self.gamma.contiguous(),
-          zoneout_mask.contiguous())
+      return LayerNormIndRNNScript(
+        self.training,
+        self.zoneout,
+        input.contiguous(),
+        state.contiguous(),
+        self.kernel.contiguous(),
+        self.recurrent_scale.contiguous(),
+        self.bias.contiguous(),
+        self.gamma.contiguous(),
+        zoneout_mask.contiguous())

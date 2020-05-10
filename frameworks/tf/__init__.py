@@ -18,12 +18,14 @@ Haste: a fast, simple, and open RNN library.
 """
 
 
+from ._version import __version__  # generated in setup.py
 from .gru import GRU
 from .gru_cell import GRUCell
 from .indrnn import IndRNN
 from .layer_norm import LayerNorm
 from .layer_norm_gru import LayerNormGRU
 from .layer_norm_gru_cell import LayerNormGRUCell
+from .layer_norm_indrnn import LayerNormIndRNN
 from .layer_norm_lstm import LayerNormLSTM
 from .layer_norm_lstm_cell import LayerNormLSTMCell
 from .lstm import LSTM
@@ -37,6 +39,7 @@ __all__ = [
     'LayerNorm',
     'LayerNormGRU',
     'LayerNormGRUCell',
+    'LayerNormIndRNN',
     'LayerNormLSTM',
     'LayerNormLSTMCell',
     'LSTM',

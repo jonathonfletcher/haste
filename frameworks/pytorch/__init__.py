@@ -19,10 +19,12 @@ Haste: a fast, simple, and open RNN library.
 
 import torch as _
 
+from ._version import __version__  # generated in setup.py
 from .gru import GRU
 from .indrnn import IndRNN
 from .lstm import LSTM
 from .layer_norm_gru import LayerNormGRU
+from .layer_norm_indrnn import LayerNormIndRNN
 from .layer_norm_lstm import LayerNormLSTM
 
 __all__ = [
@@ -30,5 +32,6 @@ __all__ = [
     'IndRNN',
     'LSTM',
     'LayerNormGRU',
+    'LayerNormIndRNN',
     'LayerNormLSTM'
 ]
